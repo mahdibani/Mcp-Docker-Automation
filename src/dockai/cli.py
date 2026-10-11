@@ -105,6 +105,13 @@ async def _run(args: argparse.Namespace) -> int:
         if not settings.gemini_api_key:
             console.print("[bold red]GEMINI_API_KEY is not set.[/] Copy .env.example to .env and add your key.")
             return 2
+        if client.get_tool("docker_status"):
+            status = await client.call("docker_status")
+            if not status.ok:
+                console.print(f"[bold red]Docker is not reachable.[/] {status.text.removeprefix('Error executing tool docker_status: ')}")
+                if args.prompt:
+                    return 4
+                console.print("[yellow]Starting anyway; requests will fail until Docker is running.[/]")
         from dockai.llm.gemini import GeminiProvider
 
         provider = GeminiProvider(settings.gemini_api_key, settings.gemini_model, settings.gemini_fallback_models)
