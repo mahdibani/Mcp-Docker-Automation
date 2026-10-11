@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -17,6 +18,15 @@ log = logging.getLogger(__name__)
 
 class TransientLLMError(RuntimeError):
     pass
+
+
+class DailyQuotaExhausted(RuntimeError):
+    """A per-day quota: retrying is pointless until tomorrow, so the model is skipped."""
+
+
+def _is_daily_quota(exc: errors.APIError) -> bool:
+    details = (exc.details or {}).get("error", {}).get("details", []) if isinstance(exc.details, dict) else []
+    return any("PerDay" in str(v.get("quotaId", "")) for d in details for v in d.get("violations", []))
 
 
 def _declaration(spec: ToolSpec) -> types.FunctionDeclaration:
@@ -36,27 +46,31 @@ def _reply(response: types.GenerateContentResponse) -> LLMReply:
 
 
 class GeminiChat(ChatSession):
-    """Wraps a google-genai async chat. On a sustained outage it moves to the next model, keeping history."""
+    """Wraps a google-genai async chat. When a model is overloaded or rate-limited, the same
+    conversation (history included) continues on the next model in the list."""
+
+    ALL_BUSY_WAIT_S = 20.0  # free-tier quotas are per minute, so one pause usually clears them
 
     def __init__(self, client: genai.Client, models: list[str], config: types.GenerateContentConfig):
         self._client = client
         self._models = models
         self._config = config
         self._index = 0
+        self._exhausted: set[str] = set()
         self._chat = client.aio.chats.create(model=models[0], config=config)
 
     @property
     def model(self) -> str:
         return self._models[self._index]
 
-    def _switch_to_next_model(self) -> bool:
-        if self._index + 1 >= len(self._models):
-            return False
+    def _use_model(self, index: int) -> None:
+        if index == self._index:
+            return
         history = self._chat.get_history()
-        self._index += 1
-        log.warning("model overloaded, falling back to %s", self.model)
+        self._index = index
+        if index:
+            log.warning("model busy, falling back to %s", self.model)
         self._chat = self._client.aio.chats.create(model=self.model, config=self._config, history=history)
-        return True
 
     async def _send(self, message: Any) -> LLMReply:
         async def attempt() -> types.GenerateContentResponse:
@@ -65,23 +79,43 @@ class GeminiChat(ChatSession):
             except errors.ServerError as exc:
                 raise TransientLLMError(f"{exc.code} {exc.status}") from exc
             except errors.ClientError as exc:
+                if exc.code == 429 and _is_daily_quota(exc):
+                    raise DailyQuotaExhausted(self.model) from exc
                 if exc.code == 429:
                     raise TransientLLMError(f"{exc.code} {exc.status}") from exc
                 raise
 
-        while True:
-            try:
-                response = await aretry(attempt, attempts=3, base_delay=2.0, retry_on=(TransientLLMError,))
-                return _reply(response)
-            except TransientLLMError as exc:
-                if self._switch_to_next_model():
+        last_error: TransientLLMError | None = None
+        for round_ in range(2):
+            # Every request starts from the preferred model again: its quota may have reset.
+            for index, model in enumerate(self._models):
+                if model in self._exhausted:
                     continue
-                raise LLMUnavailable(
-                    f"Gemini is unavailable or rate-limited on every configured model ({exc}). "
-                    "Wait a minute and try again, or change GEMINI_MODEL / GEMINI_FALLBACK_MODELS in .env."
-                ) from exc
-            except errors.ClientError as exc:
-                raise LLMUnavailable(f"Gemini rejected the request: {exc}") from exc
+                self._use_model(index)
+                try:
+                    response = await aretry(attempt, attempts=2, base_delay=2.0, retry_on=(TransientLLMError,))
+                    return _reply(response)
+                except DailyQuotaExhausted:
+                    log.warning("daily quota used up for %s, skipping it for this session", model)
+                    self._exhausted.add(model)
+                except TransientLLMError as exc:
+                    last_error = exc
+                except errors.ClientError as exc:
+                    raise LLMUnavailable(f"Gemini rejected the request: {exc}") from exc
+            if len(self._exhausted) == len(self._models):
+                break
+            if round_ == 0:
+                log.warning("all models busy, waiting %.0fs before one more round", self.ALL_BUSY_WAIT_S)
+                await asyncio.sleep(self.ALL_BUSY_WAIT_S)
+        if len(self._exhausted) == len(self._models):
+            raise LLMUnavailable(
+                "The daily free-tier quota is used up on every configured Gemini model. It resets at "
+                "midnight Pacific time; add models to GEMINI_FALLBACK_MODELS or enable billing to continue."
+            )
+        raise LLMUnavailable(
+            f"Gemini is unavailable or rate-limited on every configured model ({last_error}). "
+            "Wait a minute and try again, or change GEMINI_MODEL / GEMINI_FALLBACK_MODELS in .env."
+        ) from last_error
 
     async def send(self, user_text: str) -> LLMReply:
         return await self._send(user_text)
