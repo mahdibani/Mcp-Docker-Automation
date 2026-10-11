@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 class Settings:
     gemini_api_key: str | None
     gemini_model: str
+    gemini_fallback_models: list[str]
     mcp_command: list[str]
     max_iterations: int
 
@@ -25,7 +26,10 @@ def load_settings() -> Settings:
     mcp_command = shlex.split(raw_cmd, posix=False) if raw_cmd else [sys.executable, "-m", "dockai.server"]
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY") or None,
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+        gemini_fallback_models=[
+            m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.7-flash,gemini-3.5-flash").split(",") if m.strip()
+        ],
         mcp_command=mcp_command,
         max_iterations=int(os.getenv("DOCKAI_MAX_ITERATIONS", "8")),
     )
