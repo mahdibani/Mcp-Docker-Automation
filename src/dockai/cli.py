@@ -1,18 +1,48 @@
-"""Command-line entry point: `uv run dockai`."""
+"""Command-line entry point.
+
+    uv run dockai                 interactive REPL
+    uv run dockai "is it up?"     one-shot
+    uv run dockai --list-tools    show discovered MCP tools
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.table import Table
 
+from dockai.agent import Agent
 from dockai.config import load_settings
-from dockai.mcp_client import MCPClient, MCPConnectionError, is_destructive
+from dockai.llm.base import LLMUnavailable, ToolCall
+from dockai.mcp_client import MCPClient, MCPConnectionError, ToolResult, is_destructive
+from dockai.redact import redact
 
 console = Console()
+MAX_RESULT_CHARS = 1500
+
+
+class RichUI:
+    def show_call(self, call: ToolCall, destructive: bool) -> None:
+        args = json.dumps(redact(call.args), ensure_ascii=False)
+        style = "red" if destructive else "cyan"
+        console.print(f"[bold {style}]▶ MCP tool[/] [bold]{call.name}[/] [dim]{args}[/]")
+
+    def show_result(self, call: ToolCall, result: ToolResult) -> None:
+        body = json.dumps(redact(result.data), indent=2, ensure_ascii=False) if result.data is not None else result.text
+        if len(body) > MAX_RESULT_CHARS:
+            body = body[:MAX_RESULT_CHARS] + "\n… (truncated)"
+        title = f"{call.name} → {'ok' if result.ok else 'error'}"
+        console.print(Panel(body, title=title, title_align="left", border_style="green" if result.ok else "red"))
+
+    def confirm(self, call: ToolCall) -> bool:
+        answer = console.input(f"[bold red]Destructive action[/] [bold]{call.name}[/]. Proceed? [y/N] ")
+        return answer.strip().lower() in ("y", "yes")
 
 
 def _print_tools(client: MCPClient) -> None:
@@ -30,18 +60,63 @@ def _print_tools(client: MCPClient) -> None:
     console.print(table)
 
 
+async def _ask(agent: Agent, prompt: str) -> None:
+    answer = await agent.ask(prompt)
+    console.print(Panel(Markdown(answer), title="dockai", title_align="left", border_style="blue"))
+
+
+async def _repl(agent: Agent) -> None:
+    console.print("[bold blue]dockai[/] ready. Type a request in plain English, or [bold]exit[/] to quit.")
+    while True:
+        try:
+            prompt = console.input("[bold green]dockai>[/] ").strip()
+        except EOFError:
+            return
+        if not prompt:
+            continue
+        if prompt.lower() in ("exit", "quit", "q"):
+            return
+        try:
+            await _ask(agent, prompt)
+        except Exception as exc:  # keep the session alive after one failed request
+            console.print(f"[bold red]Error:[/] {exc}")
+
+
 async def _run(args: argparse.Namespace) -> int:
     settings = load_settings()
     async with MCPClient(settings.mcp_command) as client:
         if args.list_tools:
             _print_tools(client)
             return 0
-        console.print("[yellow]Agent mode is not implemented yet. Use --list-tools.[/]")
-        return 1
+        if not settings.gemini_api_key:
+            console.print("[bold red]GEMINI_API_KEY is not set.[/] Copy .env.example to .env and add your key.")
+            return 2
+        from dockai.llm.gemini import GeminiProvider
+
+        provider = GeminiProvider(settings.gemini_api_key, settings.gemini_model, settings.gemini_fallback_models)
+        agent = Agent(
+            client,
+            provider,
+            RichUI(),
+            max_iterations=args.max_iterations or settings.max_iterations,
+            auto_confirm=args.yes,
+        )
+        if args.prompt:
+            await _ask(agent, " ".join(args.prompt))
+        else:
+            await _repl(agent)
+        return 0
 
 
 def main() -> None:
+    # Windows consoles default to cp1252, which cannot print the symbols rich uses.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(prog="dockai", description="Manage Docker in plain English through MCP.")
+    parser.add_argument("prompt", nargs="*", help="one-shot request; omit for the interactive REPL")
+    parser.add_argument("-y", "--yes", action="store_true", help="skip y/n confirmation for destructive actions")
+    parser.add_argument("--max-iterations", type=int, help="cap on LLM/tool round trips per request")
     parser.add_argument("--list-tools", action="store_true", help="print the MCP tools and exit")
     args = parser.parse_args()
     try:
@@ -49,6 +124,9 @@ def main() -> None:
     except MCPConnectionError as exc:
         console.print(f"[bold red]MCP connection error:[/] {exc}")
         code = 2
+    except LLMUnavailable as exc:
+        console.print(f"[bold red]LLM error:[/] {exc}")
+        code = 3
     except KeyboardInterrupt:
         code = 130
     sys.exit(code)
