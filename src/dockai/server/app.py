@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sys
 
@@ -81,6 +82,17 @@ def _ports_used_by_containers(exclude_project: str | None = None) -> set[int]:
 
 
 def _require_free_port(port: int, purpose: str, param: str, exclude_project: str | None = None) -> None:
+    if exclude_project:
+        own = _docker().containers.list(filters={"label": f"com.docker.compose.project={exclude_project}"})
+        own_ports = {
+            int(b["HostPort"])
+            for c in own
+            for bindings in (c.attrs.get("NetworkSettings", {}).get("Ports") or {}).values()
+            for b in bindings or []
+            if b.get("HostPort")
+        }
+        if port in own_ports:
+            return  # the stack already holds this port; updating it in place is fine
     taken_by_containers = _ports_used_by_containers(exclude_project)
     if port in taken_by_containers or port_in_use(port):
         suggestion = suggest_free_port(port, taken=taken_by_containers)
@@ -206,10 +218,13 @@ def compose_up(
     user: str | None = None,
     postgres_version: str | None = None,
     postgres_port: int | None = None,
+    with_adminer: bool | None = None,
+    adminer_port: int | None = None,
 ) -> dict:
-    """Create or update a Postgres stack from dockai's compose template and wait until it is healthy.
+    """Create or update a Postgres stack (optionally with Adminer) from dockai's compose template.
 
-    The stack gets a named volume, a healthcheck and its own network. The password comes from
+    Waits until every service is healthy. The stack gets a named volume, a healthcheck and its own
+    network; Adminer joins that network so it can reach Postgres by the host name "postgres". The password comes from
     POSTGRES_PASSWORD in .env or is generated; it is stored in the stack folder and never returned.
     For an existing stack, omitted arguments keep their current values.
 
@@ -219,6 +234,8 @@ def compose_up(
         user: Database user (required for a new stack).
         postgres_version: Postgres image tag, e.g. "16" (default 16).
         postgres_port: Host port for Postgres (default 5432).
+        with_adminer: Add (true) or remove (false) the Adminer web UI for browsing the database.
+        adminer_port: Host port for Adminer (default from DOCKAI_ADMINER_PORT, else 8080).
     """
     stack = stack_name.lower()
     existing = compose_ops.load_meta(stack) or {}
@@ -228,6 +245,8 @@ def compose_up(
         user=user or existing.get("user") or "",
         postgres_version=str(postgres_version or existing.get("postgres_version") or "16"),
         postgres_port=int(postgres_port or existing.get("postgres_port") or 5432),
+        with_adminer=bool(with_adminer if with_adminer is not None else existing.get("with_adminer", False)),
+        adminer_port=int(adminer_port or existing.get("adminer_port") or os.getenv("DOCKAI_ADMINER_PORT") or 8080),
     )
     if not spec.database or not spec.user:
         raise ToolError("A new stack needs both `database` and `user`.")
@@ -238,6 +257,8 @@ def compose_up(
 
     _docker()
     _require_free_port(spec.postgres_port, "Postgres", "postgres_port", exclude_project=stack)
+    if spec.with_adminer:
+        _require_free_port(spec.adminer_port, "Adminer", "adminer_port", exclude_project=stack)
     directory = compose_ops.write_stack(spec)
     try:
         compose_ops.pull(stack)
@@ -257,6 +278,10 @@ def compose_up(
             "user": spec.user,
             "password": f"stored in {directory / compose_ops.SECRETS_FILE} (not shown)",
         },
+        "adminer": {
+            "url": f"http://localhost:{spec.adminer_port}",
+            "login": {"system": "PostgreSQL", "server": "postgres", "username": spec.user, "database": spec.database},
+        } if spec.with_adminer else None,
     }
 
 
