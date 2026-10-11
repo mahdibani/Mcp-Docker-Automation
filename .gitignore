@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Generated compose stacks (contain credentials)
+.dockai/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
