@@ -14,6 +14,7 @@ import sys
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -34,9 +35,22 @@ class RichUI:
         console.print(f"[bold {style}]▶ MCP tool[/] [bold]{call.name}[/] [dim]{args}[/]")
 
     def show_result(self, call: ToolCall, result: ToolResult) -> None:
-        body = json.dumps(redact(result.data), indent=2, ensure_ascii=False) if result.data is not None else result.text
-        if len(body) > MAX_RESULT_CHARS:
-            body = body[:MAX_RESULT_CHARS] + "\n… (truncated)"
+        data = redact(result.data)
+        if isinstance(data, dict):
+            # Multi-line text (logs) reads better raw than as an escaped JSON string; show the end of it.
+            text_fields = {k: v for k, v in data.items() if isinstance(v, str) and "\n" in v}
+            rest = {k: v for k, v in data.items() if k not in text_fields}
+            body = json.dumps(rest, indent=2, ensure_ascii=False) if rest else ""
+            for text in text_fields.values():
+                text = text.strip("\n")
+                if len(text) > MAX_RESULT_CHARS * 3:
+                    text = "… (earlier lines truncated)\n" + text[-MAX_RESULT_CHARS * 3:]
+                body += "\n" + text
+        else:
+            body = json.dumps(data, indent=2, ensure_ascii=False) if data is not None else result.text
+            if len(body) > MAX_RESULT_CHARS:
+                body = body[:MAX_RESULT_CHARS] + "\n… (truncated)"
+        body = escape(body)
         title = f"{call.name} → {'ok' if result.ok else 'error'}"
         console.print(Panel(body, title=title, title_align="left", border_style="green" if result.ok else "red"))
 
